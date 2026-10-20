@@ -1,0 +1,5 @@
+app/
+output/
+main.py
+requirements.txt
+settings.json
