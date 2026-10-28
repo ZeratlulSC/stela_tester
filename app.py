@@ -1,10 +1,11 @@
-
 import sys
 import serial.tools.list_ports
+import serial
 import json
 import os
 
-
+from PyQt6.QtCore import Qt
+from PyQt6.QtCore import QTimer
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -19,13 +20,19 @@ from PyQt6.QtWidgets import (
     QHBoxLayout,
     QVBoxLayout,
     QGroupBox,
-    QGridLayout
+    QGridLayout,
+    QMessageBox,
+    QPlainTextEdit,
+    QDialog
 )
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        self.usb_serial = None
+        self.rm4_serial = None
 
         self.setWindowTitle("Проверка контроллера")
         self.resize(900, 600)
@@ -40,6 +47,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(self.tabs)
 
         self.create_settings_tab()
+        self.create_test_tab()
         self.load_settings()
 
         
@@ -135,6 +143,141 @@ class MainWindow(QMainWindow):
         layout.addStretch()
 
 
+    def create_test_tab(self):
+        layout = QVBoxLayout(self.tab_test)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        # Заголовок
+        title = QLabel("Проверка устройства")
+        title.setStyleSheet(
+            "font-size: 20px; font-weight: bold;"
+        )
+        layout.addWidget(title)
+
+        # Подключение оборудования и логи
+        connection_layout = QGridLayout()
+
+        self.usb_connect_button = QPushButton("Подключить USB")
+        self.usb_connection_status = QLabel("Не подключено")
+        self.usb_connection_status.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.usb_connection_status.setStyleSheet(
+            "color: #777777; font-weight: bold;"
+        )
+
+        self.rm4_connect_button = QPushButton("Подключить RM-4")
+        self.rm4_connection_status = QLabel("Не подключено")
+        self.rm4_connection_status.setAlignment(
+            Qt.AlignmentFlag.AlignCenter
+        )
+        self.rm4_connection_status.setStyleSheet(
+            "color: #777777; font-weight: bold;"
+        )
+
+        self.usb_connect_button.clicked.connect(self.connect_usb)
+        self.rm4_connect_button.clicked.connect(self.connect_rm4)
+
+        # Окно лога USB
+        self.usb_log = QPlainTextEdit()
+        self.usb_log.setReadOnly(True)
+        self.usb_log.setPlaceholderText(
+            "Здесь будут отображаться данные USB..."
+        )
+        self.usb_log.setMaximumHeight(350)
+
+        # Окно лога RM-4
+        self.rm4_log = QPlainTextEdit()
+        self.rm4_log.setReadOnly(True)
+        self.rm4_log.setPlaceholderText(
+            "Здесь будут отображаться данные RM-4..."
+        )
+        self.rm4_log.setMaximumHeight(110)
+
+        connection_layout.addWidget(
+            self.usb_connect_button, 0, 0
+        )
+        connection_layout.addWidget(
+            self.usb_connection_status, 0, 1
+        )
+        connection_layout.addWidget(self.usb_log, 1, 0, 1, 2)
+
+        connection_layout.addWidget(
+            self.rm4_connect_button, 2, 0
+        )
+        connection_layout.addWidget(
+            self.rm4_connection_status, 2, 1
+        )
+        connection_layout.addWidget(self.rm4_log, 3, 0, 1, 2)
+
+        layout.addLayout(connection_layout)
+
+        # Периодическое чтение входящих данных
+        self.serial_timer = QTimer(self)
+        self.serial_timer.timeout.connect(self.read_serial_logs)
+        self.serial_timer.start(100)
+
+
+
+        # ICCID
+        iccid_layout = QHBoxLayout()
+
+        iccid_layout.addWidget(QLabel("ICCID:"))
+
+        self.iccid_input = QLineEdit()
+        self.iccid_input.setPlaceholderText(
+            "Введите ICCID SIM-карты"
+        )
+        iccid_layout.addWidget(self.iccid_input)
+
+        layout.addLayout(iccid_layout)
+
+        # Вывод алгоритма проверки
+        self.algorithm_button = QPushButton(
+            "Вывести алгоритм проверки"
+        )
+        layout.addWidget(self.algorithm_button)
+        self.algorithm_button.clicked.connect(self.show_algorithm)
+
+        # Этапы проверки
+        stages = [
+            "Этап 1 — Прошивка",
+            "Этап 2 — Периферия, модем и LoRa",
+            "Этап 3 — Проверка DI",
+            "Этап 4 — Проверка LED",
+            "Этап 5 — Проверка акселерометра",
+            "Этап 6 — Проверка NIDD",
+        ]
+
+        self.stage_buttons = []
+        self.stage_statuses = []
+
+        for stage in stages:
+            row = QHBoxLayout()
+
+            button = QPushButton(stage)
+            button.setMinimumHeight(36)
+
+            status = QLabel("Не проводилась")
+            status.setMinimumWidth(130)
+            status.setAlignment(
+                Qt.AlignmentFlag.AlignCenter
+            )
+            status.setStyleSheet(
+                "color: #777777; font-weight: bold;"
+            )
+
+            row.addWidget(button, 3)
+            row.addWidget(status, 1)
+
+            layout.addLayout(row)
+
+            self.stage_buttons.append(button)
+            self.stage_statuses.append(status)
+
+        layout.addStretch()
+       
 
     def get_com_ports(self):
         ports = [
@@ -174,6 +317,7 @@ class MainWindow(QMainWindow):
         with open(settings_path, "w", encoding="utf-8") as file:
             json.dump(settings, file, ensure_ascii=False, indent=4)
 
+
     def load_settings(self):
         settings_path = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -212,6 +356,7 @@ class MainWindow(QMainWindow):
             settings.get("firmware_command", "")
         )
 
+
     def set_combo_value(self, combo, value):
         if not value:
             return
@@ -220,6 +365,171 @@ class MainWindow(QMainWindow):
             combo.addItem(value)
 
         combo.setCurrentText(value)
+
+
+    def connect_usb(self):
+        if self.usb_serial is not None and self.usb_serial.is_open:
+            return
+
+        port = self.usb_controller.currentText()
+        speed = self.usb_speed.currentText()
+
+        if port == "COM-порты не найдены" or not port:
+            QMessageBox.warning(
+                self, "USB", "Не выбран COM-порт контроллера."
+            )
+            return
+
+        try:
+            self.usb_serial = serial.Serial(
+                port=port,
+                baudrate=int(speed),
+                timeout=1,
+            )
+
+            self.usb_connection_status.setText("Подключено")
+            self.usb_connection_status.setStyleSheet(
+                "color: green; font-weight: bold;"
+            )
+
+        except (serial.SerialException, ValueError) as error:
+            self.usb_serial = None
+            self.usb_connection_status.setText("Не подключено")
+
+            QMessageBox.critical(
+                self,
+                "Ошибка подключения USB",
+                f"Не удалось открыть {port}:\n{error}",
+            )
+
+
+    def connect_rm4(self):
+        if self.rm4_serial is not None and self.rm4_serial.is_open:
+            return
+
+        port = self.modbus_com.currentText()
+        speed = self.modbus_speed.currentText()
+
+        if port == "COM-порты не найдены" or not port:
+            QMessageBox.warning(
+                self, "Modbus RM-4", "Не выбран COM-порт RM-4."
+            )
+            return
+
+        try:
+            self.rm4_serial = serial.Serial(
+                port=port,
+                baudrate=int(speed),
+                timeout=1,
+            )
+
+            self.rm4_connection_status.setText("Подключено")
+            self.rm4_connection_status.setStyleSheet(
+                "color: green; font-weight: bold;"
+            )
+
+        except (serial.SerialException, ValueError) as error:
+            self.rm4_serial = None
+            self.rm4_connection_status.setText("Не подключено")
+
+            QMessageBox.critical(
+                self,
+                "Ошибка подключения RM-4",
+                f"Не удалось открыть {port}:\n{error}",
+            )
+
+
+    def read_serial_logs(self):
+        # Читаем данные контроллера
+        if self.usb_serial is not None and self.usb_serial.is_open:
+            try:
+                data = self.usb_serial.read_all()
+
+                if data:
+                    text = data.decode("utf-8", errors="replace")
+                    self.usb_log.moveCursor(
+                        self.usb_log.textCursor().MoveOperation.End
+                    )
+                    self.usb_log.insertPlainText(text)
+                    self.usb_log.ensureCursorVisible()
+
+            except serial.SerialException as error:
+                self.usb_log.appendPlainText(
+                    f"\n[Ошибка чтения USB: {error}]"
+                )
+
+        # Читаем данные RM-4
+        if self.rm4_serial is not None and self.rm4_serial.is_open:
+            try:
+                data = self.rm4_serial.read_all()
+
+                if data:
+                    text = data.decode("utf-8", errors="replace")
+                    self.rm4_log.moveCursor(
+                        self.rm4_log.textCursor().MoveOperation.End
+                    )
+                    self.rm4_log.insertPlainText(text)
+                    self.rm4_log.ensureCursorVisible()
+
+            except serial.SerialException as error:
+                self.rm4_log.appendPlainText(
+                    f"\n[Ошибка чтения RM-4: {error}]"
+                )
+
+
+
+    def show_algorithm(self):
+        text_placeholder = """1. прошивка платы
+1.1 если нет компорта - проверить подключения
+1.2 прошивка не прошла правильно - повторить прошивку платы
+2. проверка периферии стенда и линии uart lora
+2.1 Включить питание и имитацию светодиодной ленты с помощью K1-K7 (Relay1-3)
+2.2 Убедиться что все лампы HL1-6 горят 
+2.3 В случае получения сообщения  ATC<E77> - RX:\nOK  считать что линии для LoRa в порядке.
+3. проверка DI
+3.1 Дождаться строки States=.. в которой биты 0-5 установлены (таймаут 2 минуты)
+3.2 Имитировать нормальный режим датчиков(замкнуты) DI включив реле K8-K12 (Relay4)
+3.3 Дождаться строки States= в которой биты 0-4 равны "0"
+3.4 Отключить реле K8-K12 (Relay4) 
+4. проверка LED
+4.1 Дождаться строки в которой биты 5-8 равны "0"
+4.2 Снизить ток LED выключив часть макета отключив реле K5-K7 (Relay3)
+4.3 Дождаться строки с битами 5-8 в "1"
+4.4 Отключить имитацию LED отключив реле K2-K4 (Relay2)
+5. проверка акселерометра
+5.1 Получить строку с 10м битом равным "0"
+5.2 Указание наклонить плату
+5.3 Дождаться строки с 10м битом в состоянии "1" и проверить что бит 11 в состоянии "0"
+5.4 Ударить плату
+5.5 Дождаться строки States с 11м битом равным "1"
+6. проверка NIDD
+6.1 регистрация симки в тестовый стенд
+6.2 отправка сообщения
+	ATC<N21> - TX: 
+	AT+NIPDATAEX=1,0,"0189701010051400395404202601020826333330000000"
+	ATC<N21> - RX: 
+	OK
+6.3 проверка полученного сообщения
+6.4 перерегистрация симки на продакшн"""
+
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Алгоритм проверки")
+        dialog.resize(600, 400)
+
+        dialog_layout = QVBoxLayout(dialog)
+
+        algorithm_text = QPlainTextEdit()
+        algorithm_text.setReadOnly(True)
+        algorithm_text.setPlainText(text_placeholder)
+
+        dialog_layout.addWidget(algorithm_text)
+
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(dialog.accept)
+
+        dialog_layout.addWidget(close_button)
+
+        dialog.exec()
 
 
 app = QApplication(sys.argv)
