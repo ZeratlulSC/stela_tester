@@ -261,7 +261,12 @@ class MainWindow(QMainWindow):
                 button.clicked.connect(self.start_firmware_stage)
             elif stage.startswith("Этап 2"):
                 button.clicked.connect(self.start_stage2)
-
+            elif stage.startswith("Этап 3"):
+                button.clicked.connect(self.start_stage3)
+            elif stage.startswith("Этап 4"):
+                button.clicked.connect(self.start_stage4)
+            elif stage.startswith("Этап 5"):
+                button.clicked.connect(self.start_stage5)
             status = QLabel("Не проводилась")
             status.setMinimumWidth(130)
             status.setAlignment(
@@ -456,6 +461,9 @@ class MainWindow(QMainWindow):
                     )
                     self.usb_log.insertPlainText(text)
                     self.check_stage2_response(text)
+                    self.check_stage3_response(text)
+                    self.check_stage4_response(text)
+                    self.check_stage5_response(text)
                     self.usb_log.ensureCursorVisible()
 
             except serial.SerialException as error:
@@ -984,6 +992,303 @@ class MainWindow(QMainWindow):
             "ATC<E77> - RX: OK"
         )
 
+
+    def start_stage3(self):
+        if self.usb_serial is None or not self.usb_serial.is_open:
+            QMessageBox.warning(
+                self, "USB", "Сначала подключите USB контроллера."
+            )
+            return
+
+        if not self.set_rm4_relay(4, True):
+            return
+
+        self.stage3_usb_buffer = ""
+        self.stage3_waiting = True
+
+        self.stage_statuses[2].setText("Ожидание States...")
+        self.stage_statuses[2].setStyleSheet(
+            "color: #b8860b; font-weight: bold;"
+        )
+
+        self.stage3_timer = QTimer(self)
+        self.stage3_timer.setSingleShot(True)
+        self.stage3_timer.timeout.connect(
+            lambda: self.finish_stage3(False, "Тайм-аут: States не получен")
+        )
+        self.stage3_timer.start(60000)
+
+
+    def check_stage3_response(self, text):
+        if not getattr(self, "stage3_waiting", False):
+            return
+
+        self.stage3_usb_buffer += text
+        self.stage3_usb_buffer = self.stage3_usb_buffer[-2000:]
+
+        marker = "States="
+        if marker not in self.stage3_usb_buffer:
+            return
+
+        value = self.stage3_usb_buffer.split(marker, 1)[1].lstrip()
+
+        if len(value) < 5:
+            return
+
+        if value[:5] == "00000":
+            self.finish_stage3(True, "Первые 5 символов States равны нулю")
+        else:
+            self.finish_stage3(False, f"Некорректное States: {value[:5]}")
+
+
+        def finish_stage3(self, success, reason):
+            if not getattr(self, "stage3_waiting", False):
+                return
+
+            self.stage3_waiting = False
+            self.stage3_timer.stop()
+
+            # Всегда пытаемся выключить реле 4
+            relay_off = self.set_rm4_relay(4, False)
+
+            if success and relay_off:
+                self.stage_statuses[2].setText("Пройдено")
+                self.stage_statuses[2].setStyleSheet(
+                    "color: green; font-weight: bold;"
+                )
+            else:
+                self.stage_statuses[2].setText("Не пройдено")
+                self.stage_statuses[2].setStyleSheet(
+                    "color: red; font-weight: bold;"
+                )
+
+            if not relay_off:
+                QMessageBox.critical(
+                    self,
+                    "Этап 3",
+                    f"{reason}\n\nНе удалось подтвердить выключение реле 4!"
+                )
+
+
+    def start_stage4(self):
+        if self.usb_serial is None or not self.usb_serial.is_open:
+            QMessageBox.warning(
+                self, "USB", "Сначала подключите USB контроллера."
+            )
+            return
+
+        # Выключаем реле 3
+        if not self.set_rm4_relay(3, False):
+            return
+
+        self.stage4_usb_buffer = ""
+        self.stage4_waiting = True
+
+        self.stage_statuses[3].setText("Ожидание States...")
+        self.stage_statuses[3].setStyleSheet(
+            "color: #b8860b; font-weight: bold;"
+        )
+
+        self.stage4_timer = QTimer(self)
+        self.stage4_timer.setSingleShot(True)
+        self.stage4_timer.timeout.connect(
+            lambda: self.finish_stage4(
+                False, "Тайм-аут: States не получен"
+            )
+        )
+        self.stage4_timer.start(60000)
+
+
+    def check_stage4_response(self, text):
+        if not getattr(self, "stage4_waiting", False):
+            return
+
+        self.stage4_usb_buffer += text
+        self.stage4_usb_buffer = self.stage4_usb_buffer[-2000:]
+
+        marker = "States="
+        if marker not in self.stage4_usb_buffer:
+            return
+
+        value = self.stage4_usb_buffer.split(marker, 1)[1].lstrip()
+
+        if len(value) < 9:
+            return
+
+        checked_bits = value[5:9]
+
+        if checked_bits == "1111":
+            self.finish_stage4(True, "Символы 6–9 равны 1111")
+        else:
+            self.finish_stage4(
+                False,
+                f"Символы 6–9 равны {checked_bits}, ожидалось 1111"
+            )
+
+
+    def finish_stage4(self, success, reason):
+        if not getattr(self, "stage4_waiting", False):
+            return
+
+        self.stage4_waiting = False
+        self.stage4_timer.stop()
+
+        if success:
+            # При успехе выключаем реле 2
+            relay2_off = self.set_rm4_relay(2, False)
+
+            if relay2_off:
+                self.stage_statuses[3].setText("Пройдено")
+                self.stage_statuses[3].setStyleSheet(
+                    "color: green; font-weight: bold;"
+                )
+                return
+
+            success = False
+            reason = "Не удалось выключить реле 2"
+
+        # При ошибке или тайм-ауте возвращаем реле 3
+        relay3_on = self.set_rm4_relay(3, True)
+
+        self.stage_statuses[3].setText("Не пройдено")
+        self.stage_statuses[3].setStyleSheet(
+            "color: red; font-weight: bold;"
+        )
+
+        if not relay3_on:
+            reason += "\nНе удалось повторно включить реле 3!"
+
+        QMessageBox.warning(self, "Этап 4", reason)
+
+
+    def start_stage5(self):
+        if self.usb_serial is None or not self.usb_serial.is_open:
+            QMessageBox.warning(
+                self, "USB", "Сначала подключите USB контроллера."
+            )
+            return
+
+        self.stage5_phase = 1
+        self.stage5_waiting = True
+        self.stage5_usb_buffer = ""
+
+        self.stage_statuses[4].setText("Ожидание наклона платы...")
+        self.stage_statuses[4].setStyleSheet(
+            "color: #b8860b; font-weight: bold;"
+        )
+
+        # Таймер запускается сразу, не дожидаясь закрытия уведомления
+        self.stage5_timer = QTimer(self)
+        self.stage5_timer.setSingleShot(True)
+        self.stage5_timer.timeout.connect(self.stage5_timeout)
+        self.stage5_timer.start(60000)
+
+        self.stage5_prompt = QMessageBox(self)
+        self.stage5_prompt.setWindowTitle("Этап 5 — Акселерометр")
+        self.stage5_prompt.setText("Наклоните плату.")
+        self.stage5_prompt.setStandardButtons(
+            QMessageBox.StandardButton.Ok
+        )
+        self.stage5_prompt.setModal(False)
+        self.stage5_prompt.show()
+
+
+    def check_stage5_response(self, text):
+        if not getattr(self, "stage5_waiting", False):
+            return
+
+        self.stage5_usb_buffer += text
+        self.stage5_usb_buffer = self.stage5_usb_buffer[-2000:]
+
+        marker = "States="
+        if marker not in self.stage5_usb_buffer:
+            return
+
+        value = self.stage5_usb_buffer.split(marker, 1)[1].lstrip()
+
+        if len(value) < 11:
+            return
+
+        # Проверка наклона: 10-й символ = 1, 11-й = 0
+        if self.stage5_phase == 1:
+            if value[9] == "1" and value[10] == "0":
+                self.stage5_next_phase()
+            else:
+                self.finish_stage5(
+                    False,
+                    f"Проверка наклона не пройдена: "
+                    f"10-й и 11-й символы — {value[9]}{value[10]}"
+                )
+
+        # Проверка удара: 11-й символ = 1
+        elif self.stage5_phase == 2:
+            if value[10] == "1":
+                self.finish_stage5(True, "Обе проверки пройдены")
+            else:
+                self.finish_stage5(
+                    False,
+                    f"Проверка удара не пройдена: "
+                    f"11-й символ — {value[10]}"
+                )
+
+
+    def stage5_next_phase(self):
+        self.stage5_timer.stop()
+
+        if hasattr(self, "stage5_prompt"):
+            self.stage5_prompt.close()
+
+        self.stage5_phase = 2
+        self.stage5_usb_buffer = ""
+
+        self.stage_statuses[4].setText("Ожидание удара по плате...")
+
+        # Вторая проверка получает собственные 60 секунд
+        self.stage5_timer.start(60000)
+
+        self.stage5_prompt = QMessageBox(self)
+        self.stage5_prompt.setWindowTitle("Этап 5 — Акселерометр")
+        self.stage5_prompt.setText("Ударьте по плате.")
+        self.stage5_prompt.setStandardButtons(
+            QMessageBox.StandardButton.Ok
+        )
+        self.stage5_prompt.setModal(False)
+        self.stage5_prompt.show()
+
+
+    def stage5_timeout(self):
+        if not getattr(self, "stage5_waiting", False):
+            return
+
+        if self.stage5_phase == 1:
+            reason = "Не удалось обнаружить наклон платы за 60 секунд"
+        else:
+            reason = "Не удалось обнаружить удар по плате за 60 секунд"
+
+        self.finish_stage5(False, reason)
+
+
+    def finish_stage5(self, success, reason):
+        if not getattr(self, "stage5_waiting", False):
+            return
+
+        self.stage5_waiting = False
+        self.stage5_timer.stop()
+
+        if hasattr(self, "stage5_prompt"):
+            self.stage5_prompt.close()
+
+        if success:
+            self.stage_statuses[4].setText("Пройдено")
+            self.stage_statuses[4].setStyleSheet(
+                "color: green; font-weight: bold;"
+            )
+        else:
+            self.stage_statuses[4].setText("Не пройдено")
+            self.stage_statuses[4].setStyleSheet(
+                "color: red; font-weight: bold;"
+            )
+            QMessageBox.warning(self, "Этап 5", reason)
 
 
 app = QApplication(sys.argv)
