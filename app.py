@@ -4,8 +4,7 @@ import serial
 import json
 import os
 
-from PyQt6.QtCore import Qt
-from PyQt6.QtCore import QTimer
+from PyQt6.QtCore import Qt, QTimer, QProcess
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -258,6 +257,10 @@ class MainWindow(QMainWindow):
 
             button = QPushButton(stage)
             button.setMinimumHeight(36)
+            if stage.startswith("Этап 1"):
+                button.clicked.connect(self.start_firmware_stage)
+            elif stage.startswith("Этап 2"):
+                button.clicked.connect(self.start_stage2)
 
             status = QLabel("Не проводилась")
             status.setMinimumWidth(130)
@@ -286,6 +289,7 @@ class MainWindow(QMainWindow):
         ]
 
         return ports if ports else ["COM-порты не найдены"]
+
 
     def select_firmware(self):
         file_path, _ = QFileDialog.getOpenFileName(
@@ -451,6 +455,7 @@ class MainWindow(QMainWindow):
                         self.usb_log.textCursor().MoveOperation.End
                     )
                     self.usb_log.insertPlainText(text)
+                    self.check_stage2_response(text)
                     self.usb_log.ensureCursorVisible()
 
             except serial.SerialException as error:
@@ -475,7 +480,6 @@ class MainWindow(QMainWindow):
                 self.rm4_log.appendPlainText(
                     f"\n[Ошибка чтения RM-4: {error}]"
                 )
-
 
 
     def show_algorithm(self):
@@ -530,6 +534,456 @@ class MainWindow(QMainWindow):
         dialog_layout.addWidget(close_button)
 
         dialog.exec()
+
+
+    def start_firmware_stage(self):
+        if not self.show_firmware_instructions():
+            return
+        if not self.enable_board_power():
+            return
+        command = self.firmware_command.text().strip()
+
+        if not command:
+            QMessageBox.warning(
+                self,
+                "Прошивка",
+                "Сначала укажи команду для прошивки "
+                "во вкладке «Настройки».",
+            )
+            return
+
+        # Создаём окно прошивки
+        self.firmware_dialog = QDialog(self)
+        dialog = self.firmware_dialog
+        dialog.setWindowTitle("Этап 1 — Прошивка")
+        dialog.resize(650, 400)
+
+        dialog_layout = QVBoxLayout(dialog)
+
+        dialog_layout.addWidget(QLabel("Выполняемая команда:"))
+
+        command_view = QLineEdit(command)
+        command_view.setReadOnly(True)
+        dialog_layout.addWidget(command_view)
+
+        dialog_layout.addWidget(QLabel("Вывод PowerShell:"))
+
+        self.firmware_log = QPlainTextEdit()
+        self.firmware_log.setReadOnly(True)
+        dialog_layout.addWidget(self.firmware_log)
+
+        self.firmware_result = QLabel("Ожидание запуска прошивки")
+        dialog_layout.addWidget(self.firmware_result)
+
+        start_button = QPushButton("Начать прошивку")
+        dialog_layout.addWidget(start_button)
+
+        close_button = QPushButton("Закрыть")
+        close_button.clicked.connect(dialog.accept)
+        dialog_layout.addWidget(close_button)
+
+        self.firmware_timed_out = False
+
+        start_button.clicked.connect(lambda: self.run_firmware_command(command, start_button))
+
+        dialog.exec()
+
+
+    def show_firmware_instructions(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Этап 1 — Подготовка к прошивке")
+        dialog.setMinimumWidth(450)
+
+        layout = QVBoxLayout(dialog)
+
+        message = QLabel(
+            "Перед началом прошивки выполните следующие действия:\n\n"
+            "1. Поставьте джампер на JP3.\n"
+            "2. Подключите USB к плате."
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        continue_button = QPushButton("Готово, продолжить")
+        continue_button.clicked.connect(dialog.accept)
+        layout.addWidget(continue_button)
+
+        cancel_button = QPushButton("Отмена")
+        cancel_button.clicked.connect(dialog.reject)
+        layout.addWidget(cancel_button)
+
+        return dialog.exec() == QDialog.DialogCode.Accepted
+
+
+    def run_firmware_command(self, command, start_button):
+        start_button.setEnabled(False)
+
+        self.firmware_result.setText("Выполняется прошивка...")
+        self.firmware_result.setStyleSheet(
+            "color: #b8860b; font-weight: bold;"
+        )
+
+        self.firmware_timed_out = False
+
+        self.firmware_process = QProcess(self)
+        self.firmware_process.setProgram("powershell.exe")
+        self.firmware_process.setArguments([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            command,
+        ])
+
+        self.firmware_process.readyReadStandardOutput.connect(
+            self.read_firmware_output
+        )
+        self.firmware_process.readyReadStandardError.connect(
+            self.read_firmware_error
+        )
+        self.firmware_process.finished.connect(
+            self.firmware_finished
+        )
+        self.firmware_process.errorOccurred.connect(
+            self.firmware_process_error
+        )
+
+        self.firmware_timer = QTimer(self)
+        self.firmware_timer.setSingleShot(True)
+        self.firmware_timer.timeout.connect(
+            self.firmware_timeout
+        )
+
+        self.firmware_log.appendPlainText(
+            "\nЗапуск PowerShell..."
+        )
+        self.firmware_process.start()
+        self.firmware_timer.start(60000)
+
+
+    def read_firmware_output(self):
+        data = self.firmware_process.readAllStandardOutput().data()
+        if data:
+            self.firmware_log.appendPlainText(
+                data.decode("utf-8", errors="replace").rstrip()
+            )
+
+
+    def read_firmware_error(self):
+        data = self.firmware_process.readAllStandardError().data()
+        if data:
+            self.firmware_log.appendPlainText(
+                data.decode("utf-8", errors="replace").rstrip()
+            )
+
+
+    def firmware_finished(self, exit_code, exit_status):
+        self.firmware_timer.stop()
+
+        # Считываем остаток вывода перед завершением
+        self.read_firmware_output()
+        self.read_firmware_error()
+
+        if self.firmware_timed_out:
+            return
+
+        output = self.firmware_log.toPlainText()
+
+        if (exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0 and "Download verified successfully" in output):
+            self.firmware_result.setText("Прошивка: команда завершилась успешно")
+            self.stage_statuses[0].setText("Пройдено")
+            if self.disable_board_power():
+                self.show_remove_jumper_dialog()
+            self.stage_statuses[0].setStyleSheet(
+                "color: green; font-weight: bold;"
+            )
+        else:
+            self.firmware_result.setText(
+                f"Ошибка выполнения. Код завершения: {exit_code}"
+            )
+            self.stage_statuses[0].setText("Неудачно")
+            self.stage_statuses[0].setStyleSheet(
+                "color: red; font-weight: bold;"
+            )
+
+
+    def firmware_timeout(self):
+        if self.firmware_process.state() == QProcess.ProcessState.NotRunning:
+            return
+
+        self.firmware_timed_out = True
+        self.firmware_log.appendPlainText(
+            "\nВремя ожидания истекло: 60 секунд."
+        )
+        self.firmware_result.setText("Ошибка: превышено время ожидания")
+
+        self.stage_statuses[0].setText("Неудачно")
+        self.stage_statuses[0].setStyleSheet(
+            "color: red; font-weight: bold;"
+        )
+
+        self.firmware_process.kill()
+
+
+    def firmware_process_error(self, error):
+        if error == QProcess.ProcessError.FailedToStart:
+            self.firmware_timer.stop()
+            self.firmware_log.appendPlainText(
+                "Не удалось запустить PowerShell."
+            )
+            self.firmware_result.setText("Ошибка запуска процесса")
+
+            self.stage_statuses[0].setText("Неудачно")
+            self.stage_statuses[0].setStyleSheet(
+                "color: red; font-weight: bold;"
+            )
+
+
+    def enable_board_power(self):
+        if self.rm4_serial is None or not self.rm4_serial.is_open:
+            QMessageBox.warning(
+                self,
+                "RM-4 не подключён",
+                "Сначала подключите RM-4 на вкладке проверки устройства."
+            )
+            return False
+
+        command = bytes.fromhex("01 05 00 01 FF 00 DD FA")
+
+        try:
+            self.rm4_serial.reset_input_buffer()
+            self.rm4_serial.write(command)
+            self.rm4_serial.flush()
+
+            response = self.rm4_serial.read(8)
+
+            if response != command:
+                return True
+
+            QMessageBox.warning(
+                self,
+                "Ошибка RM-4",
+                f"Нет корректного подтверждения включения питания.\n"
+                f"Ответ: {response.hex(' ').upper() or 'нет ответа'}"
+            )
+            return False
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Ошибка RM-4",
+                f"Не удалось включить питание платы:\n{e}"
+            )
+            return False
+
+
+    def disable_board_power(self):
+        if self.rm4_serial is None or not self.rm4_serial.is_open:
+            QMessageBox.critical(
+                self,
+                "Ошибка RM-4",
+                "Нет подключения к RM-4. Не удалось выключить питание."
+            )
+            return False
+
+        command = bytes.fromhex("01 05 00 01 00 00 9C 0A")
+
+        try:
+            self.rm4_serial.reset_input_buffer()
+            self.rm4_serial.write(command)
+            self.rm4_serial.flush()
+
+            response = self.rm4_serial.read(8)
+
+            if response == command:
+                return True
+
+            QMessageBox.critical(
+                self,
+                "Ошибка RM-4",
+                "Не получено подтверждение выключения питания.\n"
+                f"Ответ: {response.hex(' ').upper() or 'нет ответа'}"
+            )
+            return False
+
+        except Exception as e:
+            QMessageBox.critical(
+                self,
+                "Ошибка RM-4",
+                f"Не удалось выключить питание платы:\n{e}"
+            )
+            return False
+
+
+    def show_remove_jumper_dialog(self):
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Этап 1 — Завершение")
+        dialog.setMinimumWidth(400)
+
+        layout = QVBoxLayout(dialog)
+
+        message = QLabel(
+            "Прошивка успешно завершена.\n\n"
+            "Питание платы выключено.\n\n"
+            "Уберите джампер с платы."
+        )
+        message.setWordWrap(True)
+        layout.addWidget(message)
+
+        button = QPushButton("Готово")
+        button.clicked.connect(dialog.accept)
+        layout.addWidget(button)
+
+        dialog.exec()
+
+
+    def modbus_crc16(self, data):
+        crc = 0xFFFF
+
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                if crc & 1:
+                    crc = (crc >> 1) ^ 0xA001
+                else:
+                    crc >>= 1
+
+        return crc
+
+
+    def set_rm4_relay(self, relay_number, enabled):
+        if self.rm4_serial is None or not self.rm4_serial.is_open:
+            QMessageBox.warning(
+                self, "RM-4", "Сначала подключите RM-4."
+            )
+            return False
+
+        address = relay_number.to_bytes(2, "big")
+        value = b"\xFF\x00" if enabled else b"\x00\x00"
+
+        frame = b"\x01\x05" + address + value
+        crc = self.modbus_crc16(frame)
+        command = frame + bytes([crc & 0xFF, crc >> 8])
+
+        try:
+            self.rm4_serial.reset_input_buffer()
+            self.rm4_serial.write(command)
+            self.rm4_serial.flush()
+
+            response = self.rm4_serial.read(8)
+
+            if response == command:
+                return True
+
+            QMessageBox.warning(
+                self,
+                "RM-4",
+                f"Реле {relay_number}: нет корректного ответа.\n"
+                f"Получено: {response.hex(' ').upper() or 'нет ответа'}"
+            )
+            return False
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Ошибка RM-4", str(e)
+            )
+            return False
+
+
+    def start_stage2(self):
+        # 1. Питание платы — реле 1
+        if not self.enable_board_power():
+            return
+
+        # 2. Включаем имитацию — реле 2 и 3
+        if not self.set_rm4_relay(2, True):
+            return
+
+        if not self.set_rm4_relay(3, True):
+            return
+
+        # 3. Проверяем лампы HL1–HL6
+        answer = QMessageBox.question(
+            self,
+            "Этап 2 — Проверка индикации",
+            "Горят ли лампы HL1–HL6?",
+            QMessageBox.StandardButton.Yes
+            | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+
+        if answer != QMessageBox.StandardButton.Yes:
+            self.stage_statuses[1].setText("Не пройдено")
+            self.stage_statuses[1].setStyleSheet(
+                "color: red; font-weight: bold;"
+            )
+            return
+
+        # 4. Ожидаем ответ контроллера по USB
+        if self.usb_serial is None or not self.usb_serial.is_open:
+            QMessageBox.warning(
+                self,
+                "USB",
+                "Подключите USB-порт контроллера на вкладке проверки."
+            )
+            return
+
+        self.stage2_usb_buffer = ""
+        self.stage2_waiting_for_response = True
+
+        self.stage_statuses[1].setText("Ожидание ответа контроллера...")
+        self.stage_statuses[1].setStyleSheet(
+            "color: #b8860b; font-weight: bold;"
+        )
+
+        self.stage2_timer = QTimer(self)
+        self.stage2_timer.setSingleShot(True)
+        self.stage2_timer.timeout.connect(
+            self.stage2_response_timeout
+        )
+        self.stage2_timer.start(60000)
+
+
+    def check_stage2_response(self, text):
+        if not getattr(self, "stage2_waiting_for_response", False):
+            return
+
+        self.stage2_usb_buffer += text
+
+        # Защита от бесконечного накопления данных
+        self.stage2_usb_buffer = self.stage2_usb_buffer[-2000:]
+
+        marker = "ATC<E77> - RX:"
+        if marker in self.stage2_usb_buffer:
+            response = self.stage2_usb_buffer.split(marker, 1)[1]
+
+            if "OK" in response:
+                self.stage2_waiting_for_response = False
+                self.stage2_timer.stop()
+
+                self.stage_statuses[1].setText("Пройдено")
+                self.stage_statuses[1].setStyleSheet(
+                    "color: green; font-weight: bold;"
+                )
+
+
+    def stage2_response_timeout(self):
+        if not getattr(self, "stage2_waiting_for_response", False):
+            return
+
+        self.stage2_waiting_for_response = False
+
+        self.stage_statuses[1].setText("Не пройдено — нет ответа")
+        self.stage_statuses[1].setStyleSheet(
+            "color: red; font-weight: bold;"
+        )
+
+        QMessageBox.warning(
+            self,
+            "Этап 2",
+            "За 60 секунд не получен ожидаемый ответ:\n"
+            "ATC<E77> - RX: OK"
+        )
+
 
 
 app = QApplication(sys.argv)
