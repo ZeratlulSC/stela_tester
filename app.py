@@ -3,8 +3,14 @@ import serial.tools.list_ports
 import serial
 import json
 import os
+import base64
+import urllib.request
+import urllib.error
+import ssl
+from datetime import datetime
+from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, QProcess
+from PyQt6.QtCore import Qt, QTimer, QProcess, QThread, pyqtSignal
 from PyQt6.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -22,13 +28,87 @@ from PyQt6.QtWidgets import (
     QGridLayout,
     QMessageBox,
     QPlainTextEdit,
-    QDialog
+    QDialog,
+    QInputDialog
 )
+
+MTS_USERNAME = "itel"
+MTS_PASSWORD = "itelitel"
+
+NIDD_URL = (
+    "https://m2m-manager.mts.ru/scef/v1/3gpp-nidd/v1/iteltest/configurations"
+)
+NIDD_EXTERNAL_ID_SUFFIX = "@177735220362.iot.mts.ru"
+
+
+class NiddRequestThread(QThread):
+    result = pyqtSignal(bool, int, str, str)
+
+    def __init__(self, method, url, payload=None):
+        super().__init__()
+        self.method = method
+        self.url = url
+        self.payload = payload
+
+    def run(self):
+        try:
+           credentials = f"{MTS_USERNAME}:{MTS_PASSWORD}"
+           auth = base64.b64encode(
+               credentials.encode("utf-8")
+           ).decode("ascii")
+
+           headers = {
+               "Authorization": f"Basic {auth}",
+               "Content-Type": "application/json",
+           }
+
+           body = None
+           if self.payload is not None:
+               body = json.dumps(self.payload).encode("utf-8")
+
+           request = urllib.request.Request(
+               self.url,
+               data=body,
+               headers=headers,
+               method=self.method,
+           )
+
+           # Отключаем проверку SSL
+           ssl_context = ssl._create_unverified_context()
+           ssl_context.set_ciphers("DEFAULT:@SECLEVEL=1")
+
+
+           with urllib.request.urlopen(
+               request,
+               timeout=30,
+               context=ssl_context
+           ) as response:
+               status = response.getcode()
+               response_body = response.read().decode(
+                   "utf-8", errors="replace"
+               )
+
+           self.result.emit(
+               status == 200, status, response_body, ""
+           )
+
+        except urllib.error.HTTPError as e:
+           response_body = e.read().decode(
+               "utf-8", errors="replace"
+           )
+           self.result.emit(
+               False, e.code, response_body, str(e)
+           )
+
+        except Exception as e:
+           self.result.emit(False, 0, "", str(e))
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
+
+        self.init_log_file()
 
         self.usb_serial = None
         self.rm4_serial = None
@@ -49,7 +129,34 @@ class MainWindow(QMainWindow):
         self.create_test_tab()
         self.load_settings()
 
-        
+
+    def init_log_file(self):
+        log_date = datetime.now().strftime("%d-%m-%Y")
+        log_dir = Path(__file__).resolve().parent / "logs"
+        log_dir.mkdir(exist_ok=True)
+
+        self.log_file = log_dir / f"{log_date}.txt"
+
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write("\n---\n")
+            f.write(
+                f"Начало испытаний: "
+                f"{datetime.now().strftime('%d.%m.%Y %H:%M:%S')}\n"
+            )
+
+
+    def write_log(self, message):
+        timestamp = datetime.now().strftime("%H:%M:%S")
+    
+        with open(self.log_file, "a", encoding="utf-8") as f:
+            f.write(f"[{timestamp}] {message}\n")
+    
+    
+    def set_stage_status(self, stage_index, status):
+        self.stage_statuses[stage_index].setText(status)
+        self.write_log(f"Этап {stage_index + 1}: {status}")
+    
+            
     def create_settings_tab(self):
         layout = QVBoxLayout(self.tab_settings)
         layout.setContentsMargins(20, 20, 20, 20)
@@ -218,7 +325,6 @@ class MainWindow(QMainWindow):
         self.serial_timer.start(100)
 
 
-
         # ICCID
         iccid_layout = QHBoxLayout()
 
@@ -267,6 +373,8 @@ class MainWindow(QMainWindow):
                 button.clicked.connect(self.start_stage4)
             elif stage.startswith("Этап 5"):
                 button.clicked.connect(self.start_stage5)
+            elif stage.startswith("Этап 6"):
+                button.clicked.connect(self.start_stage6)
             status = QLabel("Не проводилась")
             status.setMinimumWidth(130)
             status.setAlignment(
@@ -698,7 +806,7 @@ class MainWindow(QMainWindow):
 
         if (exit_status == QProcess.ExitStatus.NormalExit and exit_code == 0 and "Download verified successfully" in output):
             self.firmware_result.setText("Прошивка: команда завершилась успешно")
-            self.stage_statuses[0].setText("Пройдено")
+            self.set_stage_status(0, "Пройден")#self.stage_statuses[0].setText("Пройдено")
             if self.disable_board_power():
                 self.show_remove_jumper_dialog()
             self.stage_statuses[0].setStyleSheet(
@@ -708,7 +816,7 @@ class MainWindow(QMainWindow):
             self.firmware_result.setText(
                 f"Ошибка выполнения. Код завершения: {exit_code}"
             )
-            self.stage_statuses[0].setText("Неудачно")
+            self.set_stage_status(0, "Неудачно")#self.stage_statuses[0].setText("Неудачно")
             self.stage_statuses[0].setStyleSheet(
                 "color: red; font-weight: bold;"
             )
@@ -968,7 +1076,7 @@ class MainWindow(QMainWindow):
                 self.stage2_waiting_for_response = False
                 self.stage2_timer.stop()
 
-                self.stage_statuses[1].setText("Пройдено")
+                self.set_stage_status(1, "Пройден")#self.stage_statuses[1].setText("Пройдено")
                 self.stage_statuses[1].setStyleSheet(
                     "color: green; font-weight: bold;"
                 )
@@ -980,7 +1088,7 @@ class MainWindow(QMainWindow):
 
         self.stage2_waiting_for_response = False
 
-        self.stage_statuses[1].setText("Не пройдено — нет ответа")
+        self.set_stage_status(1, "Не пройдено — нет ответа")#self.stage_statuses[1].setText("Не пройдено — нет ответа")
         self.stage_statuses[1].setStyleSheet(
             "color: red; font-weight: bold;"
         )
@@ -1052,12 +1160,12 @@ class MainWindow(QMainWindow):
             relay_off = self.set_rm4_relay(4, False)
 
             if success and relay_off:
-                self.stage_statuses[2].setText("Пройдено")
+                self.set_stage_status(2, "Пройден")#self.stage_statuses[2].setText("Пройдено")
                 self.stage_statuses[2].setStyleSheet(
                     "color: green; font-weight: bold;"
                 )
             else:
-                self.stage_statuses[2].setText("Не пройдено")
+                self.set_stage_status(2, "Не пройдено")#self.stage_statuses[2].setText("Не пройдено")
                 self.stage_statuses[2].setStyleSheet(
                     "color: red; font-weight: bold;"
                 )
@@ -1138,7 +1246,7 @@ class MainWindow(QMainWindow):
             relay2_off = self.set_rm4_relay(2, False)
 
             if relay2_off:
-                self.stage_statuses[3].setText("Пройдено")
+                self.set_stage_status(3, "Пройден")#self.stage_statuses[3].setText("Пройдено")
                 self.stage_statuses[3].setStyleSheet(
                     "color: green; font-weight: bold;"
                 )
@@ -1150,7 +1258,7 @@ class MainWindow(QMainWindow):
         # При ошибке или тайм-ауте возвращаем реле 3
         relay3_on = self.set_rm4_relay(3, True)
 
-        self.stage_statuses[3].setText("Не пройдено")
+        self.set_stage_status(3, "Не пройдено")#self.stage_statuses[3].setText("Не пройдено")
         self.stage_statuses[3].setStyleSheet(
             "color: red; font-weight: bold;"
         )
@@ -1279,16 +1387,188 @@ class MainWindow(QMainWindow):
             self.stage5_prompt.close()
 
         if success:
-            self.stage_statuses[4].setText("Пройдено")
+            self.set_stage_status(4, "Пройден")#self.stage_statuses[4].setText("Пройдено")
             self.stage_statuses[4].setStyleSheet(
                 "color: green; font-weight: bold;"
             )
         else:
-            self.stage_statuses[4].setText("Не пройдено")
+            self.set_stage_status(4, "Не пройдено")#self.stage_statuses[4].setText("Не пройдено")
             self.stage_statuses[4].setStyleSheet(
                 "color: red; font-weight: bold;"
             )
             QMessageBox.warning(self, "Этап 5", reason)
+
+
+    def start_stage6(self):
+
+        iccid = self.iccid_input.text().strip()
+
+        if not iccid:
+            QMessageBox.warning(
+                self,
+                "Ошибка",
+                "Введите ICCID SIM-карты."
+            )
+            return
+
+        self.write_log(f"ICCID: {iccid}")
+        
+        external_id, ok = QInputDialog.getText(
+            self,
+            "Этап 6 — NIDD",
+            "Введите externalId SIM-карты:"
+        )
+
+        if not ok:
+            return
+
+        external_id = external_id.strip()
+
+        if not external_id:
+            QMessageBox.warning(
+                self, "Ошибка", "externalId не может быть пустым."
+            )
+            return
+
+        self.nidd_external_id = (
+            external_id + NIDD_EXTERNAL_ID_SUFFIX
+        )
+
+        self.nidd_first_config_id = None
+
+        self.stage_statuses[5].setText("Создание конфигурации /test...")
+
+        payload = {
+            "externalId": self.nidd_external_id,
+            "duration": "2035-12-31T23:59:59Z",
+            "notificationDestination": "http://62.112.123.210:1981/test",
+            "pdnEstablishmentOption": "WAIT_FOR_UE",
+            "reliableDataService": False,
+            "maximumPacketSize": 65535,
+        }
+
+        self.nidd_start_request(
+            "POST",
+            NIDD_URL,
+            payload,
+            "create_test"
+        )
+
+
+    def nidd_start_request(self, method, url, payload, action):
+        self.nidd_action = action
+
+        thread = NiddRequestThread(method, url, payload)
+        self.nidd_threads = getattr(self, "nidd_threads", [])
+        self.nidd_threads.append(thread)
+
+        thread.result.connect(self.nidd_request_finished)
+        thread.finished.connect(
+            lambda t=thread: self.nidd_threads.remove(t)
+            if t in self.nidd_threads else None
+        )
+
+        thread.start()
+
+
+    def nidd_request_finished(self, success, status, body, error):
+        action = self.nidd_action
+
+        if not success:
+            self.stage_statuses[5].setText("Не пройден")
+
+            QMessageBox.critical(
+                self,
+                "Ошибка NIDD",
+                f"Операция: {action}\n"
+                f"HTTP status: {status}\n"
+                f"Ошибка: {error}\n"
+                f"Ответ сервера: {body}"
+            )
+            return
+
+        if action in ("create_test", "create_data"):
+            try:
+                response = json.loads(body)
+                config_self = response["self"]
+                config_id = config_self.rstrip("/").rsplit("/", 1)[-1]
+
+                if not config_id:
+                    raise ValueError("Пустой configId")
+
+            except (ValueError, KeyError, TypeError):
+                self.stage_statuses[5].setText("Не пройден")
+                QMessageBox.critical(
+                    self,
+                    "Ошибка NIDD",
+                    f"Не удалось получить configId из поля self.\n"
+                    f"Ответ: {body}"
+                )
+                return
+
+        if action == "create_test":
+            self.nidd_first_config_id = config_id
+
+            QMessageBox.information(
+                self,
+                "Этап 6 — NIDD",
+                "Конфигурация /test создана.\n\n"
+                "Наклоните плату."
+            )
+
+            answer = QMessageBox.question(
+                self,
+                "Этап 6 — NIDD",
+                "Данные поступили на сервер?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, QMessageBox.StandardButton.No
+            )
+
+            if answer != QMessageBox.StandardButton.Yes:
+                self.stage_statuses[5].setText("Не пройден")
+                return
+
+            self.stage_statuses[5].setText("Удаление конфигурации /test...")
+
+            delete_url = (
+                NIDD_URL + "/" + str(self.nidd_first_config_id)
+            )
+
+            self.nidd_start_request(
+                "DELETE",
+                delete_url,
+                None,
+                "delete_test"
+            )
+
+        elif action == "delete_test":
+            self.stage_statuses[5].setText("Создание конфигурации /Data...")
+
+            payload = {
+                "externalId": self.nidd_external_id,
+                "duration": "2035-12-31T23:59:59Z",
+                "notificationDestination": "http://62.112.123.210:1981/Data",
+                "pdnEstablishmentOption": "WAIT_FOR_UE",
+                "reliableDataService": False,
+                "maximumPacketSize": 65535,
+            }
+
+            self.nidd_start_request(
+                "POST",
+                NIDD_URL,
+                payload,
+                "create_data"
+            )
+
+        elif action == "create_data":
+            self.set_stage_status(5, "Пройден")#self.stage_statuses[5].setText("Пройден")
+
+            QMessageBox.information(
+                self,
+                "Этап 6 — NIDD",
+                "Тест успешно пройден.\n\n"
+                "Конфигурация /Data создана и оставлена активной.\n"
+                f"configId: {config_id}"
+            )
 
 
 app = QApplication(sys.argv)
